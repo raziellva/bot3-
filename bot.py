@@ -934,7 +934,7 @@ async def callback_handler(client, callback_query: CallbackQuery):
     config_map = {
         "general": "resolution=720x480 crf=28 audio_bitrate=70k fps=22 preset=veryfast codec=libx264",
         "reels": "resolution=420x720 crf=25 audio_bitrate=70k fps=30 preset=veryfast codec=libx264",
-        "show": "resolution=854x480 crf=35 audio_bitrate=70k fps=20 preset=veryfast codec=libx264",
+        "show": "resolution=854x480 crf=32 audio_bitrate=70k fps=20 preset=veryfast codec=libx264",
         "anime": "resolution=854x480 crf=32 audio_bitrate=64k fps=18 preset=veryfast codec=libx264"
     }
 
