@@ -414,7 +414,6 @@ async def set_user_plan(user_id: int, plan: str):
         await send_protected_message(
             user_id,
             f"🎉 **¡Se te ha asignado un nuevo plan!**\n"
-                        f"Use el comando /start para iniciar en el bot\n\n"
             f"• **Plan**: {plan.capitalize()}\n"
             f"• **Duración**: {PLAN_DURATIONS[plan]}\n"
             f"• **Videos disponibles**: {PLAN_LIMITS[plan]}\n\n"
@@ -683,11 +682,9 @@ async def compress_video(client, message: Message, start_msg):
         # Registrar compresión activa
         await add_active_compression(user_id, message.video.file_id)
 
-        # Crear mensaje de progreso como respuesta al video original
         msg = await app.send_message(
             chat_id=message.chat.id,
-            text="📥 **Iniciando Descarga** 📥",
-            reply_to_message_id=message.id  # Respuesta al video original
+            text="📥 **Iniciando Descarga** 📥"
         )
         # Registrar este mensaje en mensajes activos
         active_messages.add(msg.id)
@@ -748,18 +745,20 @@ async def compress_video(client, message: Message, start_msg):
             logger.error(f"Error obteniendo duración: {e}", exc_info=True)
             dur_total = 0
 
-        # Mensaje de inicio de compresión como respuesta al video
-        await msg.edit(
-            f"╭✠╼━━━━━━━━━━━━━━━✠╮\n"
-            f"┠🗜️𝗖𝗼𝗺𝗺𝗽𝗿𝗶𝗺𝗶𝗲𝗻𝗱𝗼 𝗩𝗶𝗱𝗲𝗼🎬\n"
-            f"╰✠╼━━━━━━━━━━━━━━━✠╯\n\n"
-            f"📤𝘊𝘢𝘳𝘨𝘢𝘯𝘥𝘰 𝘝𝘪𝘥𝘦𝘰📤",
-            reply_markup=cancel_button
-        )
+        await msg.edit(f"🗜️**INICIANDO COMPRESIÓN..**📥\n"
+                      f"📦 Tamaño original: {original_size // (1024 * 1024)} MB")
         
         compressed_video_path = f"{os.path.splitext(original_video_path)[0]}_compressed.mp4"
         logger.info(f"Ruta de compresión: {compressed_video_path}")
         
+        # Nuevo mensaje de progreso para compresión
+        progress_message = (
+            "╭✠╼━━━━━━━━━━━━━━━✠╮\n"
+            "┠🗜️𝗖𝗼𝗺𝗽𝗿𝗶𝗺𝗶𝗲𝗻𝗱𝗼 𝗩𝗶𝗱𝗲𝗼🎬\n"
+            "╰✠╼━━━━━━━━━━━━━━━✠╯\n\n"
+        )
+        await msg.edit(f"{progress_message}Preparando compresión...")
+
         drawtext_filter = f"drawtext=text='@InfiniteNetwork_KG':x=w-tw-10:y=10:fontsize=20:fontcolor=white"
 
         ffmpeg_command = [
@@ -781,11 +780,6 @@ async def compress_video(client, message: Message, start_msg):
             # Registrar tarea de ffmpeg
             register_cancelable_task(user_id, "ffmpeg", process)
             
-            progress_header = (
-                "╭✠╼━━━━━━━━━━━━━━━✠╮\n"
-                "┠🗜️𝗖𝗼𝗺𝗺𝗽𝗿𝗶𝗺𝗶𝗲𝗻𝗱𝗼 𝗩𝗶𝗱𝗲𝗼🎬\n"
-                "╰✠╼━━━━━━━━━━━━━━━✠╯\n\n"
-            )
             last_percent = 0
             last_update_time = 0
             time_pattern = re.compile(r"time=(\d+:\d+:\d+\.\d+)")
@@ -830,7 +824,7 @@ async def compress_video(client, message: Message, start_msg):
                             ]])
                             try:
                                 await msg.edit(
-                                    f"{progress_header}Progreso: {bar}",
+                                    f"{progress_message}Progreso: {bar}",
                                     reply_markup=cancel_button
                                 )
                             except MessageNotModified:
@@ -878,7 +872,6 @@ async def compress_video(client, message: Message, start_msg):
             processing_time = datetime.datetime.now() - start_time
             processing_time_str = str(processing_time).split('.')[0]
             
-
             description = (
                 "╭✠━━━━━━━━━━━━━━━━━━━━✠╮\n"
                 f"┠**Vídeo comprimído correctamente**✅\n┠**Tiempo de procesamiento**: {processing_time_str}\n╰✠━━━━━━━━━━━━━━━━━━━━✠╯\n"
@@ -886,12 +879,7 @@ async def compress_video(client, message: Message, start_msg):
             
             try:
                 start_upload_time = time.time()
-                # Mensaje de subida como respuesta al video original
-                upload_msg = await app.send_message(
-                    chat_id=message.chat.id,
-                    text="📤 **Subiendo video comprimido** 📤",
-                    reply_to_message_id=message.id
-                )
+                upload_msg = await app.send_message(chat_id=message.chat.id, text="📤 **Subiendo video comprimido** 📤")
                 # Registrar mensaje de subida
                 active_messages.add(upload_msg.id)
                 
@@ -1134,7 +1122,7 @@ async def callback_handler(client, callback_query: CallbackQuery):
             else:
                 if await has_active_compression(user_id) or pending_count > 0:
                     await callback_query.answer(
-                        "⚠️ Ya hay un video en proceso de compresión o en cola.\n"
+                        "⚠️ Ya hay un video en proceso o en cola.\n"
                         "Espera a que termine antes de enviar otro video.",
                         show_alert=True
                     )
