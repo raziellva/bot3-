@@ -50,14 +50,6 @@ banned_col = db["banned_users"]
 pending_confirmations_col = db["pending_confirmations"]
 active_compressions_col = db["active_compressions"]
 
-# ======== LIMPIEZA INICIAL DE CONFIRMACIONES EXPIRADAS ======== #
-now = datetime.datetime.now()
-ten_minutes_ago = now - datetime.timedelta(minutes=10)
-pending_confirmations_col.delete_many({
-    "timestamp": {"$lt": ten_minutes_ago}
-})
-logger.info(f"Confirmaciones expiradas eliminadas")
-
 # Configuración del bot
 api_id = API_ID
 api_hash = API_HASH
@@ -106,9 +98,9 @@ active_messages = set()
 # Diccionario para almacenar las tareas cancelables por usuario
 cancel_tasks = {}
 
-def register_cancelable_task(user_id, task_type, task):
+def register_cancelable_task(user_id, task_type, task, original_message_id=None):
     """Registra una tarea que puede ser cancelada"""
-    cancel_tasks[user_id] = {"type": task_type, "task": task}
+    cancel_tasks[user_id] = {"type": task_type, "task": task, "original_message_id": original_message_id}
 
 def unregister_cancelable_task(user_id):
     """Elimina el registro de una tarea cancelable"""
@@ -143,12 +135,16 @@ async def cancel_command(client, message):
     # Cancelar compresión activa
     if user_id in cancel_tasks:
         if cancel_user_task(user_id):
+            # Obtener ID del mensaje original para responder
+            original_message_id = cancel_tasks[user_id].get("original_message_id")
+            unregister_cancelable_task(user_id)
+            
+            # Enviar mensaje de cancelación respondiendo al video original
             await send_protected_message(
                 message.chat.id,
-                "⛔ **Operación cancelada exitosamente!** ⛔\n"
-                "La tarea actual ha sido detenida."
+                "⛔ **Operación cancelada por el usuario** ⛔",
+                reply_to_message_id=original_message_id
             )
-            unregister_cancelable_task(user_id)
         else:
             await send_protected_message(
                 message.chat.id,
@@ -196,23 +192,31 @@ async def remove_active_compression(user_id: int):
 # ======================== SISTEMA DE CONFIRMACIÓN ======================== #
 
 async def has_pending_confirmation(user_id: int) -> bool:
-    """Verifica si el usuario tiene una confirmación pendiente (últimos 10 min)"""
+    """Verifica si el usuario tiene una confirmación pendiente (no expirada)"""
     now = datetime.datetime.now()
-    ten_minutes_ago = now - datetime.timedelta(minutes=10)
-    return bool(pending_confirmations_col.find_one({
+    expiration_time = now - datetime.timedelta(minutes=10)
+    
+    # Eliminar confirmaciones expiradas
+    pending_confirmations_col.delete_many({
         "user_id": user_id,
-        "timestamp": {"$gte": ten_minutes_ago}  # Solo confirmaciones recientes
-    }))
+        "timestamp": {"$lt": expiration_time}
+    })
+    
+    # Verificar si queda alguna confirmación activa
+    return bool(pending_confirmations_col.find_one({"user_id": user_id}))
 
 async def create_confirmation(user_id: int, chat_id: int, message_id: int, file_id: str, file_name: str):
-    """Crea una nueva confirmación pendiente con timestamp"""
+    """Crea una nueva confirmación pendiente eliminando cualquier confirmación previa"""
+    # Eliminar cualquier confirmación previa para el mismo usuario
+    pending_confirmations_col.delete_many({"user_id": user_id})
+    
     return pending_confirmations_col.insert_one({
         "user_id": user_id,
         "chat_id": chat_id,
         "message_id": message_id,
         "file_id": file_id,
         "file_name": file_name,
-        "timestamp": datetime.datetime.now()  # Asegurar timestamp
+        "timestamp": datetime.datetime.now()
     }).inserted_id
 
 async def delete_confirmation(confirmation_id: ObjectId):
@@ -692,6 +696,7 @@ async def compress_video(client, message: Message, start_msg):
 
         logger.info(f"Iniciando compresión para chat_id: {message.chat.id}, video: {message.video.file_name}")
         user_id = message.from_user.id
+        original_message_id = message.id  # Guardar ID del mensaje original para cancelación
 
         # Registrar compresión activa
         await add_active_compression(user_id, message.video.file_id)
@@ -714,7 +719,7 @@ async def compress_video(client, message: Message, start_msg):
         try:
             start_download_time = time.time()
             # Registrar tarea de descarga
-            register_cancelable_task(user_id, "download", None)
+            register_cancelable_task(user_id, "download", None, original_message_id=original_message_id)
             
             original_video_path = await app.download_media(
                 message.video,
@@ -763,10 +768,7 @@ async def compress_video(client, message: Message, start_msg):
 
         # Mensaje de inicio de compresión como respuesta al video
         await msg.edit(
-            f"╭✠╼━━━━━━━━━━━━━━━✠╮\n"
-            f"┠🗜️𝗖𝗼𝗺𝗺𝗽𝗿𝗶𝗺𝗶𝗲𝗻𝗱𝗼 𝗩𝗶𝗱𝗲𝗼🎬\n"
-            f"╰✠╼━━━━━━━━━━━━━━━✠╯\n\n"
-            f"📤𝘊𝘢𝘳𝘨𝘢𝘯𝘥𝘰 𝘝𝘪𝘥𝘦𝘰📤",
+            f"📤 𝘊𝘢𝘳𝘨𝘢𝘯𝘥𝘰 𝘝𝘪𝘥𝘦𝘰 📤",
             reply_markup=cancel_button
         )
         
@@ -792,7 +794,7 @@ async def compress_video(client, message: Message, start_msg):
             process = subprocess.Popen(ffmpeg_command, stderr=subprocess.PIPE, text=True, bufsize=1)
             
             # Registrar tarea de ffmpeg
-            register_cancelable_task(user_id, "ffmpeg", process)
+            register_cancelable_task(user_id, "ffmpeg", process, original_message_id=original_message_id)
             
             progress_header = (
                 "╭✠╼━━━━━━━━━━━━━━━✠╮\n"
@@ -909,7 +911,7 @@ async def compress_video(client, message: Message, start_msg):
                 active_messages.add(upload_msg.id)
                 
                 # Registrar tarea de subida
-                register_cancelable_task(user_id, "upload", None)
+                register_cancelable_task(user_id, "upload", None, original_message_id=original_message_id)
                 
                 if thumbnail_path and os.path.exists(thumbnail_path):
                     await send_protected_video(
@@ -1072,7 +1074,7 @@ async def callback_handler(client, callback_query: CallbackQuery):
         "general": "resolution=854x480 crf=28 audio_bitrate=70k fps=22 preset=veryfast codec=libx264",
         "reels": "resolution=420x720 crf=25 audio_bitrate=70k fps=30 preset=veryfast codec=libx264",
         "show": "resolution=854x480 crf=32 audio_bitrate=70k fps=20 preset=veryfast codec=libx264",
-        "anime": "resolution=854x480 crf=32 audio_bitrate=64k fps=18 preset=veryfast codec=libx264"
+        "anime": "resolution=854x480 crf=32 audio_bitrate=150k fps=18 preset=veryfast codec=libx264"
     }
 
     quality_names = {
@@ -1090,6 +1092,8 @@ async def callback_handler(client, callback_query: CallbackQuery):
             return
             
         if cancel_user_task(user_id):
+            # Guardar el original_message_id antes de desregistrar
+            original_message_id = cancel_tasks[user_id].get("original_message_id")
             unregister_cancelable_task(user_id)
             # Remover mensaje de activos y eliminarlo
             msg_to_delete = callback_query.message
@@ -1100,10 +1104,19 @@ async def callback_handler(client, callback_query: CallbackQuery):
             except Exception as e:
                 logger.error(f"Error eliminando mensaje de progreso: {e}")
             await callback_query.answer("⛔ Tarea cancelada! ⛔", show_alert=True)
-            await app.send_message(
-                callback_query.message.chat.id,
-                "⛔ **Operación cancelada por el usuario** ⛔"
-            )
+            # Enviar mensaje de cancelación respondiendo al video original
+            try:
+                await app.send_message(
+                    callback_query.message.chat.id,
+                    "⛔ **Operación cancelada por el usuario** ⛔",
+                    reply_to_message_id=original_message_id
+                )
+            except:
+                # Si falla, enviar sin reply
+                await app.send_message(
+                    callback_query.message.chat.id,
+                    "⛔ **Operación cancelada por el usuario** ⛔"
+                )
         else:
             await callback_query.answer("⚠️ No se pudo cancelar la tarea", show_alert=True)
         return
@@ -1195,9 +1208,9 @@ async def callback_handler(client, callback_query: CallbackQuery):
 
         elif action == "cancel":
             await delete_confirmation(confirmation_id)
-            await callback_query.answer("❌ Compresión cancelada.", show_alert=True)
+            await callback_query.answer("⛔ Compresión cancelada.⛔", show_alert=True)
             try:
-                await callback_query.message.edit_text("❌ **Compresión cancelada.**")
+                await callback_query.message.edit_text("⛔ **Compresión cancelada.** ⛔")
                 # Borrar mensaje después de 5 segundos
                 await asyncio.sleep(5)
                 await callback_query.message.delete()
@@ -1322,7 +1335,7 @@ async def start_command(client, message):
             "• 📊 Mi Plan: Ver tu plan actual\n"
             "• ℹ️ Ayuda: Obtener información de uso\n"
             "• 👀 Ver Cola: Ver estado de la cola de compresión\n\n" 
-            "**⚙️ Versión 10.5.8 ⚙️**"
+            "**⚙️ Versión 11.0.5 ⚙️**"
         )
         
         # Enviar la foto con el caption
@@ -1869,16 +1882,17 @@ async def handle_video(client, message: Message):
             message.video.file_name
         )
         
-        # Paso 7: Enviar mensaje de confirmación con botones
+        # Paso 7: Enviar mensaje de confirmación con botones (respondiendo al video)
         keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Confirmar compresión", callback_data=f"confirm_{confirmation_id}")],
-            [InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel_{confirmation_id}")]
+            [InlineKeyboardButton("🟢 Confirmar compresión 🟢", callback_data=f"confirm_{confirmation_id}")],
+            [InlineKeyboardButton("⛔ Cancelar ⛔", callback_data=f"cancel_{confirmation_id}")]
         ])
         
         await send_protected_message(
             message.chat.id,
-            f"🎬 **Video recibido para comprimír:** `{message.video.file_name}`\n"
+            f"🎬 **Video recibido para comprimír:** `{message.video.file_name}`\n\n"
             f"¿Deseas comprimir este video?",
+            reply_to_message_id=message.id,  # Respuesta al video original
             reply_markup=keyboard
         )
         
