@@ -750,7 +750,10 @@ async def compress_video(client, message: Message, start_msg):
 
         # Mensaje de inicio de compresión como respuesta al video
         await msg.edit(
-            f"📤𝘊𝘢𝘳𝘨𝘢𝘯𝘥𝘰 𝘷𝘪𝘥𝘦𝘰📤",
+            f"╭✠╼━━━━━━━━━━━━━━━✠╮\n"
+            f"┠🗜️𝗖𝗼𝗺𝗺𝗽𝗿𝗶𝗺𝗶𝗲𝗻𝗱𝗼 𝗩𝗶𝗱𝗲𝗼🎬\n"
+            f"╰✠╼━━━━━━━━━━━━━━━✠╯\n\n"
+            f"📤𝘊𝘢𝘳𝘨𝘢𝘯𝘥𝘰 𝘝𝘪𝘥𝘦𝘰📤",
             reply_markup=cancel_button
         )
         
