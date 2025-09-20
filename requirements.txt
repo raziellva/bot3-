@@ -1,4 +1,4 @@
-kurigram
+pyrogram 
 requests
 aiofiles
 aiohttp
