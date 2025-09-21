@@ -53,8 +53,7 @@ temp_keys_col = db["temp_keys"]
 banned_col = db["banned_users"]
 pending_confirmations_col = db["pending_confirmations"]
 active_compressions_col = db["active_compressions"]
-user_settings_col = db["user_settings"]
-download_tasks_col = db["download_tasks"]  # Nueva colección para tareas de descarga
+user_settings_col = db["user_settings"]  # Nueva colección para configuraciones de usuario
 
 # Configuración del bot
 api_id = API_ID
@@ -80,7 +79,6 @@ for banned_user in banned_users_in_db:
 
 # Limpiar compresiones activas previas al iniciar
 active_compressions_col.delete_many({})
-download_tasks_col.delete_many({})  # Limpiar tareas de descarga previas
 logger.info("Compresiones activas previas eliminadas")
 
 # Configuración de compresión de video (configuración global por defecto)
@@ -93,173 +91,901 @@ DEFAULT_VIDEO_SETTINGS = {
     'codec': 'libx264'
 }
 
-# Variables globales para las colas
-download_queue = asyncio.Queue()
+# Variables globales para la cola
 compression_queue = asyncio.Queue()
 processing_task = None
-download_executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)  # 2 descargas simultáneas
-compression_executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)  # 1 compresión a la vez
+executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
 # Conjunto para rastrear mensajes de progreso activos
 active_messages = set()
 
-# ======================== NUEVO SISTEMA DE DESCARGAS SIMULTÁNEAS ======================== #
+# ======================== NUEVAS FUNCIONES PARA EXPORTACIÓN/IMPORTACIÓN DE DB ======================== #
 
-async def process_download_queue():
-    """Procesa la cola de descargas con hasta 2 workers simultáneos"""
-    while True:
-        client, message, wait_msg, confirmation_data = await download_queue.get()
-        try:
-            # Verificar si la tarea aún está en download_tasks_col (no fue cancelada)
-            download_task = download_tasks_col.find_one({
-                "chat_id": message.chat.id,
-                "message_id": message.id
-            })
-            if not download_task:
-                logger.info(f"Tarea de descarga cancelada, saltando: {message.video.file_name}")
-                download_queue.task_done()
-                continue
-
-            # Procesar la descarga
-            await process_download(client, message, wait_msg, confirmation_data)
-        except Exception as e:
-            logger.error(f"Error procesando descarga: {e}", exc_info=True)
-            try:
-                await app.send_message(message.chat.id, f"⚠️ Error al descargar el video: {str(e)}")
-            except:
-                pass
-        finally:
-            download_queue.task_done()
-
-async def process_download(client, message, wait_msg, confirmation_data):
-    """Procesa una descarga individual"""
-    user_id = message.from_user.id
-    original_message_id = message.id
-    
+@app.on_message(filters.command("getdb") & filters.user(admin_users))
+async def get_db_command(client, message):
+    """Exporta la base de datos de usuarios a un archivo JSON"""
     try:
-        # Crear mensaje de progreso de descarga
-        download_msg = await app.send_message(
-            chat_id=message.chat.id,
-            text="📥 **Iniciando Descarga** 📥",
-            reply_to_message_id=message.id
-        )
-        active_messages.add(download_msg.id)
+        # Obtener todos los usuarios
+        users = list(users_col.find({}))
         
-        # Registrar tarea de descarga
-        register_cancelable_task(user_id, "download", None, original_message_id=original_message_id, progress_message_id=download_msg.id)
+        # Obtener la cantidad de usuarios
+        user_count = len(users)
         
-        start_download_time = time.time()
-        
-        # Descargar el video
-        file_path = await download_media_with_cancellation(
-            message, download_msg, user_id, start_download_time
-        )
-        
-        # Verificar si se canceló durante la descarga
-        if user_id not in cancel_tasks:
-            logger.info("Descarga cancelada por el usuario")
-            if file_path and os.path.exists(file_path):
-                os.remove(file_path)
-            unregister_cancelable_task(user_id)
-            if download_msg.id in active_messages:
-                active_messages.remove(download_msg.id)
-            try:
-                await download_msg.delete()
-            except:
-                pass
-            return
-        
-        # Descarga completada, agregar a la cola de compresión
-        logger.info(f"Video descargado: {file_path}")
-        
-        # Actualizar estado en la base de datos
-        download_tasks_col.update_one(
-            {"chat_id": message.chat.id, "message_id": message.id},
-            {"$set": {"status": "downloaded", "file_path": file_path}}
-        )
-        
-        # Agregar a la cola de compresión
-        pending_col.insert_one({
-            "user_id": user_id,
-            "video_id": message.video.file_id,
-            "file_name": message.video.file_name,
-            "file_path": file_path,
-            "chat_id": message.chat.id,
-            "message_id": message.id,
-            "timestamp": datetime.datetime.now(),
-            "confirmation_data": confirmation_data
-        })
-        
-        # Notificar al usuario que la descarga completó y está en cola de compresión
-        queue_size = compression_queue.qsize()
-        await download_msg.edit(
-            f"✅ **Descarga completada**\n\n"
-            f"📋 Posición en cola de compresión: {queue_size + 1}\n\n"
-            f"• **Esperando turno para comprimir** ⏳"
-        )
-        
-        # Agregar a la cola de compresión
-        await compression_queue.put((app, message, download_msg, file_path, confirmation_data))
-        
+        # Crear un archivo temporal
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8') as tmp_file:
+            json.dump(users, tmp_file, default=str, indent=4)
+            tmp_file.flush()
+            
+            # Enviar el archivo con la cantidad de usuarios en el caption
+            await message.reply_document(
+                document=tmp_file.name,
+                caption=f"📊 Copia de la base de datos de usuarios\n👤**Usuarios:** {user_count}"
+            )
+            
+            # Eliminar el archivo temporal
+            os.unlink(tmp_file.name)
+            
     except Exception as e:
-        logger.error(f"Error en process_download: {e}", exc_info=True)
-        try:
-            await app.send_message(message.chat.id, f"⚠️ Error en la descarga: {str(e)}")
-        except:
-            pass
-        finally:
-            if 'download_msg' in locals() and download_msg.id in active_messages:
-                active_messages.remove(download_msg.id)
-            unregister_cancelable_task(user_id)
+        logger.error(f"Error en get_db_command: {e}", exc_info=True)
+        await message.reply("❌ Error al exportar la base de datos")
 
-async def process_compression_queue():
-    """Procesa la cola de compresión (1 a la vez)"""
+@app.on_message(filters.command("restdb") & filters.user(admin_users))
+async def rest_db_command(client, message):
+    """Solicita el archivo JSON para restaurar la base de datos"""
+    await message.reply(
+        "🔄 **Modo restauración activado**\n\n"
+        "Envía el archivo JSON de la base de datos " 
+        "que deseas restaurar."
+    )
+
+@app.on_message(filters.document & filters.user(admin_users))
+async def handle_db_restore(client, message):
+    """Maneja la restauración de la base de datos desde un archivo JSON"""
+    try:
+        # Verificar que sea un archivo JSON
+        if not message.document.file_name.endswith('.json'):
+            return
+            
+        # Descargar el archivo
+        file_path = await message.download()
+        
+        # Leer el archivo JSON
+        with open(file_path, 'r', encoding='utf-8') as f:
+            users_data = json.load(f)
+        
+        # Validar la estructura del JSON
+        if not isinstance(users_data, list):
+            await message.reply("❌ El archivo JSON no tiene la estructura correcta.")
+            os.remove(file_path)
+            return
+            
+        # Eliminar todos los usuarios actuales
+        users_col.delete_many({})
+        
+        # Insertar los nuevos usuarios
+        if users_data:
+            # Convertir fechas de string a datetime
+            for user in users_data:
+                if 'join_date' in user and isinstance(user['join_date'], str):
+                    user['join_date'] = datetime.datetime.fromisoformat(user['join_date'])
+                if 'expires_at' in user and user['expires_at'] and isinstance(user['expires_at'], str):
+                    user['expires_at'] = datetime.datetime.fromisoformat(user['expires_at'])
+            
+            users_col.insert_many(users_data)
+        
+        # Eliminar el archivo temporal
+        os.remove(file_path)
+        
+        await message.reply(
+            f"✅ **Base de datos restaurada exitosamente**\n\n"
+            f"Se restauraron {len(users_data)} usuarios."
+        )
+        
+        logger.info(f"Base de datos restaurada por {message.from_user.id} con {len(users_data)} usuarios")
+        
+    except json.JSONDecodeError:
+        await message.reply("❌ El archivo no es un JSON válido.")
+    except Exception as e:
+        logger.error(f"Error restaurando base de datos: {e}", exc_info=True)
+        await message.reply("❌ Error al restaurar la base de datos.")
+
+# ======================== FUNCIÓN PARA FORMATEAR TIEMPO ======================== #
+
+def format_time(seconds):
+    """Formatea segundos a formato HH:MM:SS o MM:SS"""
+    if seconds < 0:
+        return "00:00"
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours > 0:
+        return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+    else:
+        return f"{minutes:02d}:{seconds:02d}"
+
+# ======================== SISTEMA DE CONFIGURACIÓN POR USUARIO ======================== #
+
+async def get_user_video_settings(user_id: int) -> dict:
+    """Obtiene la configuración de video personalizada del usuario o la global por defecto"""
+    user_settings = user_settings_col.find_one({"user_id": user_id})
+    if user_settings and "video_settings" in user_settings:
+        return user_settings["video_settings"]
+    return DEFAULT_VIDEO_SETTINGS.copy()
+
+async def update_user_video_settings(user_id: int, command: str):
+    """Actualiza la configuración de video personalizada del usuario"""
+    try:
+        settings = command.split()
+        new_settings = {}
+        for setting in settings:
+            if '=' in setting:
+                key, value = setting.split('=', 1)
+                # Validar que la configuración es válida
+                if key in DEFAULT_VIDEO_SETTINGS:
+                    new_settings[key] = value
+        
+        if new_settings:
+            # Actualizar o insertar la configuración del usuario
+            user_settings_col.update_one(
+                {"user_id": user_id},
+                {"$set": {"video_settings": new_settings}},
+                upsert=True
+            )
+            logger.info(f"Configuración actualizada para usuario {user_id}: {new_settings}")
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Error actualizando configuración para usuario {user_id}: {e}", exc_info=True)
+        return False
+
+async def reset_user_video_settings(user_id: int):
+    """Restablece la configuración del usuario a los valores por defecto"""
+    user_settings_col.delete_one({"user_id": user_id})
+    logger.info(f"Configuración restablecida para usuario {user_id}")
+
+# ======================== SISTEMA DE CANCELACIÓN MEJORADO ======================== #
+# Diccionario para almacenar las tareas cancelables por usuario
+cancel_tasks = {}
+# Diccionario para almacenar los procesos FFmpeg por usuario
+ffmpeg_processes = {}
+
+def register_cancelable_task(user_id, task_type, task, original_message_id=None, progress_message_id=None):
+    """Registra una tarea que puede ser cancelada"""
+    cancel_tasks[user_id] = {
+        "type": task_type, 
+        "task": task, 
+        "original_message_id": original_message_id,
+        "progress_message_id": progress_message_id
+    }
+
+def unregister_cancelable_task(user_id):
+    """Elimina el registro de una tarea cancelable"""
+    if user_id in cancel_tasks:
+        del cancel_tasks[user_id]
+
+def register_ffmpeg_process(user_id, process):
+    """Registra un proceso FFmpeg para un usuario"""
+    ffmpeg_processes[user_id] = process
+
+def unregister_ffmpeg_process(user_id):
+    """Elimina el registro de un proceso FFmpeg"""
+    if user_id in ffmpeg_processes:
+        del ffmpeg_processes[user_id]
+
+def cancel_user_task(user_id):
+    """Cancela la tarea activa de un usuario"""
+    if user_id in cancel_tasks:
+        task_info = cancel_tasks[user_id]
+        try:
+            if task_info["type"] == "download":
+                # Para descargas, marcamos para cancelación
+                return True
+            elif task_info["type"] == "ffmpeg" and user_id in ffmpeg_processes:
+                process = ffmpeg_processes[user_id]
+                if process.poll() is None:
+                    process.terminate()
+                    # Esperar un poco y forzar kill si es necesario
+                    time.sleep(1)
+                    if process.poll() is None:
+                        process.kill()
+                    return True
+            elif task_info["type"] == "upload":
+                # Para subidas, marcamos para cancelación
+                return True
+        except Exception as e:
+            logger.error(f"Error cancelando tarea: {e}")
+    return False
+
+# Hilo para verificar cancelaciones
+def cancellation_checker():
+    """Hilo que verifica constantemente las solicitudes de cancelación"""
     while True:
-        client, message, wait_msg, file_path, confirmation_data = await compression_queue.get()
         try:
-            # Verificar si la tarea aún está en pending_col (no fue cancelada)
-            pending_task = pending_col.find_one({
-                "chat_id": message.chat.id,
-                "message_id": message.id
-            })
-            if not pending_task:
-                logger.info(f"Tarea de compresión cancelada, saltando: {message.video.file_name}")
-                compression_queue.task_done()
-                continue
+            for user_id in list(cancel_tasks.keys()):
+                task_info = cancel_tasks[user_id]
+                if task_info["type"] == "ffmpeg" and user_id in ffmpeg_processes:
+                    process = ffmpeg_processes[user_id]
+                    if process.poll() is not None:
+                        # Proceso ya terminado, limpiar
+                        unregister_cancelable_task(user_id)
+                        unregister_ffmpeg_process(user_id)
+            time.sleep(0.5)  # Verificar cada medio segundo
+        except Exception as e:
+            logger.error(f"Error en cancellation_checker: {e}")
+            time.sleep(1)
 
-            # Iniciar compresión
-            start_msg = await wait_msg.edit("🗜️**Iniciando compresión**🎬")
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                compression_executor, 
-                threading_compress_video, 
-                client, message, start_msg, file_path, confirmation_data
+# Iniciar hilo de verificación de cancelaciones
+cancellation_thread = threading.Thread(target=cancellation_checker, daemon=True)
+cancellation_thread.start()
+
+@app.on_message(filters.command("cancel") & filters.private)
+async def cancel_command(client, message):
+    """Maneja el comando de cancelación"""
+    user_id = message.from_user.id
+    
+    # Cancelar compresión activa
+    if user_id in cancel_tasks:
+        task_info = cancel_tasks[user_id]
+        original_message_id = task_info.get("original_message_id")
+        progress_message_id = task_info.get("progress_message_id")
+        
+        if cancel_user_task(user_id):
+            unregister_cancelable_task(user_id)
+            unregister_ffmpeg_process(user_id)
+            
+            # Eliminar mensaje de progreso si existe
+            if progress_message_id:
+                try:
+                    await app.delete_messages(message.chat.id, progress_message_id)
+                    if progress_message_id in active_messages:
+                        active_messages.remove(progress_message_id)
+                except Exception as e:
+                    logger.error(f"Error eliminando mensaje de progreso: {e}")
+            
+            # Enviar mensaje de cancelación respondiendo al video original
+            await send_protected_message(
+                message.chat.id,
+                "⛔ **Compresión cancelada** ⛔",
+                reply_to_message_id=original_message_id
+            )
+        else:
+            await send_protected_message(
+                message.chat.id,
+                "⚠️ **No se pudo cancelar la operación**\n"
+                "La tarea podría haber finalizado ya."
+            )
+    else:
+        # Cancelar tareas en cola
+        result = pending_col.delete_many({"user_id": user_id})
+        if result.deleted_count > 0:
+            await send_protected_message(
+                message.chat.id,
+                f"⛔ **Se cancelaron {result.deleted_count} tareas pendientes en la cola.** ⛔"
+            )
+        else:
+            await send_protected_message(
+                message.chat.id,
+                "ℹ️ **No tienes operaciones activas ni en cola para cancelar.**"
+            )
+    
+    # Borrar mensaje de comando /cancel
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.error(f"Error borrando mensaje /cancel: {e}")
+
+# ======================== NUEVA FUNCIÓN PARA CANCELAR VIDEOS EN COLA ======================== #
+
+@app.on_message(filters.command("cancelqueue") & filters.private)
+async def cancel_queue_command(client, message):
+    """Permite a los usuarios cancelar videos específicos de su cola"""
+    try:
+        user_id = message.from_user.id
+        
+        # Verificar si el usuario está baneado
+        if user_id in ban_users:
+            return
+            
+        # Verificar si el usuario tiene un plan
+        user_plan = await get_user_plan(user_id)
+        if user_plan is None or user_plan.get("plan") is None:
+            await send_protected_message(
+                message.chat.id,
+                "**Usted no tiene acceso para usar este bot.**\n\n"
+                "💲 Para ver los planes disponibles usa el comando /planes\n\n"
+                "👨🏻‍💻 Para más información, contacte a @InfiniteNetworkAdmin."
+            )
+            return
+            
+        # Obtener los videos en cola del usuario
+        user_queue = list(pending_col.find({"user_id": user_id}).sort("timestamp", 1))
+        
+        if not user_queue:
+            await send_protected_message(
+                message.chat.id,
+                "📋**No tienes videos en la cola de compresión.**"
+            )
+            return
+            
+        # Si no se especifica índice, mostrar la lista de videos en cola
+        parts = message.text.split()
+        if len(parts) == 1:
+            response = "**Tus videos en cola:**\n\n"
+            for i, item in enumerate(user_queue, 1):
+                file_name = item.get("file_name", "Sin nombre")
+                timestamp = item.get("timestamp")
+                time_str = timestamp.strftime("%H:%M:%S") if timestamp else "¿?"
+                response += f"{i}. `{file_name}` (⏰ {time_str})\n"
+                
+            response += "\nPara cancelar un video, usa /cancelqueue <número>\n"
+            response += "Para cancelar todos, usa /cancelqueue --all"
+            
+            await send_protected_message(message.chat.id, response)
+            return
+            
+        # Manejar --all para cancelar todos los videos
+        if parts[1] == "--all":
+            # Primero obtener todos los wait_message_id para eliminar los mensajes
+            wait_message_ids = []
+            for item in user_queue:
+                wait_msg_id = item.get("wait_message_id")
+                if wait_msg_id:
+                    wait_message_ids.append(wait_msg_id)
+            
+            result = pending_col.delete_many({"user_id": user_id})
+            
+            # Intentar eliminar los mensajes de espera
+            try:
+                if wait_message_ids:
+                    for msg_id in wait_message_ids:
+                        try:
+                            await app.delete_messages(chat_id=message.chat.id, message_ids=msg_id)
+                        except Exception as e:
+                            logger.error(f"Error eliminando mensaje de espera: {e}")
+            except Exception as e:
+                logger.error(f"Error eliminando mensajes de espera: {e}")
+            
+            await send_protected_message(
+                message.chat.id,
+                f"**Se cancelaron {result.deleted_count} videos de tu cola.**"
+            )
+            return
+            
+        # Manejar cancelación de un video específico
+        try:
+            index = int(parts[1])
+            if index < 1 or index > len(user_queue):
+                await send_protected_message(
+                    message.chat.id,
+                    f"**Número inválido.** Debe estar entre 1 y {len(user_queue)}."
+                )
+                return
+                
+            # Eliminar el video específico de la cola
+            video_to_cancel = user_queue[index-1]
+            wait_message_id = video_to_cancel.get("wait_message_id")
+            
+            pending_col.delete_one({"_id": video_to_cancel["_id"]})
+            
+            # Intentar eliminar el mensaje de espera
+            try:
+                if wait_message_id:
+                    await app.delete_messages(chat_id=message.chat.id, message_ids=wait_message_id)
+            except Exception as e:
+                logger.error(f"Error eliminando mensaje de espera: {e}")
+            
+            await send_protected_message(
+                message.chat.id,
+                f"**Video cancelado:** `{video_to_cancel.get('file_name', 'Sin nombre')}`\n\n"
+                f"✅ Eliminado de la cola de compresión."
+            )
+            
+        except ValueError:
+            await send_protected_message(
+                message.chat.id,
+                "**Usa** /cancelqueue <número> **o** /cancelqueue --all"
+            )
+            
+    except Exception as e:
+        logger.error(f"Error en cancel_queue_command: {e}", exc_info=True)
+        await send_protected_message(
+            message.chat.id,
+            "**Error al procesar la solicitud.**"
+        )
+
+# ======================== GESTIÓN DE COMPRESIONES ACTIVAS ======================== #
+
+async def has_active_compression(user_id: int) -> bool:
+    """Verifica si el usuario ya tiene una compresión activa"""
+    return bool(active_compressions_col.find_one({"user_id": user_id}))
+
+async def add_active_compression(user_id: int, file_id: str):
+    """Registra una nueva compresión activa"""
+    active_compressions_col.insert_one({
+        "user_id": user_id,
+        "file_id": file_id,
+        "start_time": datetime.datetime.now()
+    })
+
+async def remove_active_compression(user_id: int):
+    """Elimina una compresión activa"""
+    active_compressions_col.delete_one({"user_id": user_id})
+
+# ======================== SISTEMA DE CONFIRMACIÓN ======================== #
+
+async def has_pending_confirmation(user_id: int) -> bool:
+    """Verifica si el usuario tiene una confirmación pendiente (no expirada)"""
+    now = datetime.datetime.now()
+    expiration_time = now - datetime.timedelta(minutes=10)
+    
+    # Eliminar confirmaciones expiradas
+    pending_confirmations_col.delete_many({
+        "user_id": user_id,
+        "timestamp": {"$lt": expiration_time}
+    })
+    
+    # Verificar si queda alguna confirmación activa
+    return bool(pending_confirmations_col.find_one({"user_id": user_id}))
+
+async def create_confirmation(user_id: int, chat_id: int, message_id: int, file_id: str, file_name: str):
+    """Crea una nueva confirmación pendiente eliminando cualquier confirmación previa"""
+    # Eliminar cualquier confirmación previa para el mismo usuario
+    pending_confirmations_col.delete_many({"user_id": user_id})
+    
+    return pending_confirmations_col.insert_one({
+        "user_id": user_id,
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "file_id": file_id,
+        "file_name": file_name,
+        "timestamp": datetime.datetime.now()
+    }).inserted_id
+
+async def delete_confirmation(confirmation_id: ObjectId):
+    """Elimina una confirmación pendiente"""
+    pending_confirmations_col.delete_one({"_id": confirmation_id})
+
+async def get_confirmation(confirmation_id: ObjectId):
+    """Obtiene una confirmación pendiente"""
+    return pending_confirmations_col.find_one({"_id": confirmation_id})
+
+# ======================== AUTO-REGISTRO DE USUARIOS ======================== #
+
+async def register_new_user(user_id: int):
+    """Registra un nuevo usuario si no existe"""
+    if not users_col.find_one({"user_id": user_id}):
+        logger.info(f"Usuario no registrado: {user_id}")
+
+# ======================== FUNCIONES PROTECCIÓN DE CONTENIDO ======================== #
+
+async def should_protect_content(user_id: int) -> bool:
+    """Determina si el contenido debe protegerse según el plan del usuario"""
+    if user_id in admin_users:
+        return False
+    user_plan = await get_user_plan(user_id)
+    return user_plan is None or user_plan["plan"] == "standard"
+
+async def send_protected_message(chat_id: int, text: str, **kwargs):
+    """Envía un mensaje con protección según el plan del usuario"""
+    protect = await should_protect_content(chat_id)
+    return await app.send_message(chat_id, text, protect_content=protect, **kwargs)
+
+async def send_protected_video(chat_id: int, video: str, caption: str = None, **kwargs):
+    """Envía un video con protección según el plan del usuario"""
+    protect = await should_protect_content(chat_id)
+    return await app.send_video(chat_id, video, caption=caption, protect_content=protect, **kwargs)
+
+async def send_protected_photo(chat_id: int, photo: str, caption: str = None, **kwargs):
+    """Envía una foto con protección según el plan del usuario"""
+    protect = await should_protect_content(chat_id)
+    return await app.send_photo(chat_id, photo, caption=caption, protect_content=protect, **kwargs)
+
+# ======================== SISTEMA DE LÍMITES DE COLA ======================== #
+
+async def get_user_queue_limit(user_id: int) -> int:
+    """Obtiene el límite de cola del usuario basado en su plan"""
+    user_plan = await get_user_plan(user_id)
+    if user_plan is None:
+        return 1  # Límite por defecto para usuarios sin plan
+    
+    if user_plan["plan"] == "ultra":
+        return ULTRA_QUEUE_LIMIT
+    return PREMIUM_QUEUE_LIMIT if user_plan["plan"] == "premium" else 1
+
+# ======================== SISTEMA DE CLAVES TEMPORALES ======================== #
+
+def generate_temp_key(plan: str, duration_value: int, duration_unit: str):
+    """Genera una clave temporal válida para un plan específico"""
+    key = ''.join(random.choices(string.ascii_letters + string.digits, k=10))
+    created_at = datetime.datetime.now()
+    
+    # Calcular la expiración basada en la unidad de tiempo
+    if duration_unit == 'minutes':
+        expires_at = created_at + datetime.timedelta(minutes=duration_value)
+    elif duration_unit == 'hours':
+        expires_at = created_at + datetime.timedelta(hours=duration_value)
+    else:  # días por defecto
+        expires_at = created_at + datetime.timedelta(days=duration_value)
+    
+    temp_keys_col.insert_one({
+        "key": key,
+        "plan": plan,
+        "created_at": created_at,
+        "expires_at": expires_at,
+        "used": False,
+        "duration_value": duration_value,
+        "duration_unit": duration_unit
+    })
+    
+    return key
+
+def is_valid_temp_key(key):
+    """Verifica si una clave temporal es válida"""
+    now = datetime.datetime.now()
+    key_data = temp_keys_col.find_one({
+        "key": key,
+        "used": False,
+        "expires_at": {"$gt": now}
+    })
+    return bool(key_data)
+
+def mark_key_used(key):
+    """Marca una clave como usada"""
+    temp_keys_col.update_one({"key": key}, {"$set": {"used": True}})
+
+@app.on_message(filters.command("generatekey") & filters.user(admin_users))
+async def generate_key_command(client, message):
+    """Genera una nueva clave temporal para un plan específico (solo admins)"""
+    try:
+        parts = message.text.split()
+        if len(parts) != 4:
+            await message.reply("⚠️ Formato: /generatekey <plan> <cantidad> <unidad>\nEjemplo: /generatekey standard 2 hours\nUnidades válidas: minutes, hours, days")
+            return
+            
+        plan = parts[1].lower()
+        valid_plans = ["standard", "pro", "premium"]  # No incluir "ultra" en claves temporales
+        if plan not in valid_plans:
+            await message.reply(f"⚠️ Plan inválido. Opciones válidas: {', '.join(valid_plans)}")
+            return
+            
+        try:
+            duration_value = int(parts[2])
+            if duration_value <= 0:
+                await message.reply("⚠️ La cantidad debe ser un número positivo")
+                return
+        except ValueError:
+            await message.reply("⚠️ La cantidad debe ser un número entero")
+            return
+
+        duration_unit = parts[3].lower()
+        valid_units = ["minutes", "hours", "days"]
+        if duration_unit not in valid_units:
+            await message.reply(f"⚠️ Unidad inválida. Opciones válidas: {', '.join(valid_units)}")
+            return
+
+        key = generate_temp_key(plan, duration_value, duration_unit)
+        
+        # Texto para mostrar la duración en formato amigable
+        duration_text = f"{duration_value} {duration_unit}"
+        if duration_value == 1:
+            duration_text = duration_text[:-1]  # Remover la 's' final para singular
+        
+        await message.reply(
+            f"**Clave {plan.capitalize()} generada**\n\n"
+            f"Clave: `{key}`\n"
+            f"Válida por: {duration_text}\n\n"
+            f"Comparte esta clave con el usuario usando:\n"
+            f"`/key {key}`"
+        )
+    except Exception as e:
+        logger.error(f"Error generando clave: {e}", exc_info=True)
+        await message.reply("⚠️ Error al generar la clave")
+
+@app.on_message(filters.command("listkeys") & filters.user(admin_users))
+async def list_keys_command(client, message):
+    """Lista todas las claves temporales activas (solo admins)"""
+    try:
+        now = datetime.datetime.now()
+        keys = list(temp_keys_col.find({"used": False, "expires_at": {"$gt": now}}))
+        
+        if not keys:
+            await message.reply("**No hay claves activas.**")
+            return
+            
+        response = "**Claves temporales activas:**\n\n"
+        for key in keys:
+            expires_at = key["expires_at"]
+            remaining = expires_at - now
+            
+            # Formatear el tiempo restante
+            if remaining.days > 0:
+                time_remaining = f"{remaining.days}d {remaining.seconds//3600}h"
+            elif remaining.seconds >= 3600:
+                time_remaining = f"{remaining.seconds//3600}h {(remaining.seconds%3600)//60}m"
+            else:
+                time_remaining = f"{remaining.seconds//60}m"
+            
+            # Formatear la duración original
+            duration_value = key.get("duration_value", 0)
+            duration_unit = key.get("duration_unit", "days")
+            
+            duration_display = f"{duration_value} {duration_unit}"
+            if duration_value == 1:
+                duration_display = duration_display[:-1]  # Singular
+            
+            response += (
+                f"• `{key['key']}`\n"
+                f"  ↳ Plan: {key['plan'].capitalize()}\n"
+                f"  ↳ Duración: {duration_display}\n"
+                f"  ⏱ Expira en: {time_remaining}\n\n"
+            )
+            
+        await message.reply(response)
+    except Exception as e:
+        logger.error(f"Error listando claves: {e}", exc_info=True)
+        await message.reply("⚠️ Error al listar claves")
+
+@app.on_message(filters.command("delkeys") & filters.user(admin_users))
+async def del_keys_command(client, message):
+    """Elimina claves temporales (solo admins)"""
+    try:
+        parts = message.text.split()
+        if len(parts) < 2:
+            await message.reply("⚠️ Formato: /delkeys <key> o /delkeys --all")
+            return
+
+        option = parts[1]
+
+        if option == "--all":
+            # Eliminar todas las claves
+            result = temp_keys_col.delete_many({})
+            await message.reply(f"**Se eliminaron {result.deleted_count} claves.**")
+        else:
+            # Eliminar clave específica
+            key = option
+            result = temp_keys_col.delete_one({"key": key})
+            if result.deleted_count > 0:
+                await message.reply(f"✅ **Clave {key} eliminada.**")
+            else:
+                await message.reply("⚠️ **Clave no encontrada.**")
+    except Exception as e:
+        logger.error(f"Error eliminando claves: {e}", exc_info=True)
+        await message.reply("⚠️ **Error al eliminar claves**")
+
+# ======================== SISTEMA DE PLANES ======================== #
+
+PLAN_DURATIONS = {
+    "standard": "7 días",
+    "pro": "15 días",
+    "premium": "30 días",
+    "ultra": "Ilimitado"  
+}
+
+async def get_user_plan(user_id: int) -> dict:
+    """Obtiene el plan del usuario desde la base de datos y elimina si ha expirado"""
+    user = users_col.find_one({"user_id": user_id})
+    now = datetime.datetime.now()
+    
+    if user:
+        plan = user.get("plan")
+        # Si el plan es None, eliminamos el usuario y retornamos None
+        if plan is None:
+            users_col.delete_one({"user_id": user_id})
+            return None
+
+        # Si tiene plan, verificamos la expiración (excepto para plan ultra)
+        if plan != "ultra":  # El plan ultra no expira
+            expires_at = user.get("expires_at")
+            if expires_at and now > expires_at:
+                users_col.delete_one({"user_id": user_id})
+                return None
+
+        # Si llegamos aquí, el usuario tiene un plan no nulo y no expirado
+        # Actualizar campos si faltan
+        update_data = {}
+        if "last_used_date" not in user:
+            update_data["last_used_date"] = None
+        
+        if update_data:
+            users_col.update_one({"user_id": user_id}, {"$set": update_data})
+            user.update(update_data)
+        
+        return user
+        
+    return None
+
+async def set_user_plan(user_id: int, plan: str, notify: bool = True, expires_at: datetime = None):
+    """Establece el plan de un usuario and notifica si notify=True"""
+    if plan not in PLAN_DURATIONS:
+        return False
+        
+    # Para el plan ultra, no establecer fecha de expiración
+    if plan == "ultra":
+        expires_at = None
+    else:
+        # Si no se proporciona expires_at, calcularlo según el plan
+        if expires_at is None:
+            now = datetime.datetime.now()
+            if plan == "standard":
+                expires_at = now + datetime.timedelta(days=7)
+            elif plan == "pro":
+                expires_at = now + datetime.timedelta(days=15)
+            elif plan == "premium":
+                expires_at = now + datetime.timedelta(days=30)
+
+    # Actualizar o insertar el usuario con el plan y la fecha de expiración
+    user_data = {
+        "plan": plan
+    }
+    if expires_at is not None:
+        user_data["expires_at"] = expires_at
+
+    # Si el usuario no existe, se establecerá join_date en la inserción
+    existing_user = users_col.find_one({"user_id": user_id})
+    if not existing_user:
+        user_data["join_date"] = datetime.datetime.now()
+
+    users_col.update_one(
+        {"user_id": user_id},
+        {"$set": user_data},
+        upsert=True
+    )
+    
+    # Notificar al usuario sobre su nuevo plan solo si notify es True
+    if notify:
+        try:
+            await send_protected_message(
+                user_id,
+                f"**¡Se te ha asignado un nuevo plan!**\n"
+                f"Use el comando /start para iniciar en el bot\n\n"
+                f"• **Plan**: {plan.capitalize()}\n"
+                f"• **Duración**: {PLAN_DURATIONS[plan]}\n"
+                f"• **Videos disponibles**: Ilimitados\n\n"
+                f"¡Disfruta de tus beneficios! 🎬"
             )
         except Exception as e:
-            logger.error(f"Error procesando compresión: {e}", exc_info=True)
-            try:
-                await app.send_message(message.chat.id, f"⚠️ Error al comprimir el video: {str(e)}")
-            except:
-                pass
-        finally:
-            # Eliminar de pending_col y descargar tareas
-            pending_col.delete_one({"video_id": message.video.file_id})
-            download_tasks_col.delete_one({
-                "chat_id": message.chat.id,
-                "message_id": message.id
-            })
-            compression_queue.task_done()
+            logger.error(f"Error notificando al usuario {user_id}: {e}")
+    
+    return True
 
-def threading_compress_video(client, message, start_msg, file_path, confirmation_data):
-    """Wrapper para ejecutar compresión en un hilo separado"""
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(compress_video(client, message, start_msg, file_path, confirmation_data))
-    loop.close()
+async def check_user_limit(user_id: int) -> bool:
+    """Verifica si el usuario ha alcanzado su límite de compresión"""
+    user = await get_user_plan(user_id)
+    if user is None or user.get("plan") is None:
+        return True  # Usuario sin plan no puede comprimir
+        
+    # Todos los planes tienen compresión ilimitada
+    return False
 
-# ======================== FIN NUEVO SISTEMA DE DESCARGAS SIMULTÁNEAS ======================== #
+# En la función get_plan_info, modifica el mensaje para incluir el botón
+async def get_plan_info(user_id: int) -> str:
+    """Obtiene información del plan del usuario para mostrar"""
+    user = await get_user_plan(user_id)
+    if user is None or user.get("plan") is None:
+        # Mensaje modificado para incluir el botón
+        return (
+            "**No tienes un plan activo.**\n\n⬇️**Toque para ver nuestros planes**⬇️"
+        )
+    
+    plan_name = user["plan"].capitalize()
+    
+    expires_at = user.get("expires_at")
+    expires_text = "No expira"
+    
+    if isinstance(expires_at, datetime.datetime):
+        now = datetime.datetime.now()
+        time_remaining = expires_at - now
+        
+        if time_remaining.total_seconds() <= 0:
+            expires_text = "Expirado"
+        else:
+            # Calcular días, horas, minutos y segundos restantes
+            days = time_remaining.days
+            hours = time_remaining.seconds // 3600
+            minutes = (time_remaining.seconds % 3600) // 60
+            seconds = time_remaining.seconds % 60
+            
+            # Formatear texto con días, minutos y segundos
+            if days > 0:
+                expires_text = f"{days} días {minutes}min {seconds}s"
+            elif hours > 0:
+                expires_text = f"{hours}h {minutes}m {seconds}s"
+            else:
+                expires_text = f"{minutes} minutos {seconds} segundos"
+    
+    return (
+        f"╭✠━━━━━━━━━━━━━━━━━━✠╮\n"
+        f"┠➣ **Plan actual**: {plan_name}\n"
+        f"┠➣ **Tiempo restante**:\n"
+        f"┠➣ {expires_text}\n"
+        f"╰✠━━━━━━━━━━━━━━━━━━✠╯"
+    )
 
-# ... (el resto del código se mantiene igual hasta la función download_media_with_cancellation)
+# ======================== FUNCIÓN PARA VERIFICAR VÍDEOS EN COLA ======================== #
+
+async def has_pending_in_queue(user_id: int) -> bool:
+    """Verifica si el usuario tiene videos pendientes en la cola"""
+    count = pending_col.count_documents({"user_id": user_id})
+    return count > 0
+
+# ======================== FIN SISTEMA DE PLANES ======================== #
+
+def sizeof_fmt(num, suffix="B"):
+    """Formatea el tamaño de bytes a formato legible"""
+    for unit in ["", "K", "M", "G", "T", "P", "E", "Z"]:
+        if abs(num) < 1024.0:
+            return "%3.2f%s%s" % (num, unit, suffix)
+        num /= 1024.0
+    return "%.2f%s%s" % (num, "Yi", suffix)
+
+def create_progress_bar(current, total, proceso, length=15):
+    """Crea una barra de progreso visual"""
+    if total == 0:
+        total = 1
+    percent = current / total
+    filled = int(length * percent)
+    bar = '⬢' * filled + '⬡' * (length - filled)
+    return (
+        f'    ╭━━━[🤖**Compress Bot**]━━━╮\n'
+        f'┠ [{bar}] {round(percent * 100)}%\n'
+        f'┠ **Procesado**: {sizeof_fmt(current)}/{sizeof_fmt(total)}\n'
+        f'┠ **Estado**: __#{proceso}__'
+    )
+
+last_progress_update = {}
+
+# ... (código anterior se mantiene igual)
+
+async def progress_callback(current, total, msg, proceso, start_time):
+    """Callback para mostrar progreso de descarga/subida"""
+    try:
+        # Verificar si este mensaje aún está activo
+        if msg.id not in active_messages:
+            return
+            
+        now = datetime.datetime.now()
+        key = (msg.chat.id, msg.id)
+        last_time = last_progress_update.get(key)
+
+        if last_time and (now - last_time).total_seconds() < 5:
+            return
+
+        last_progress_update[key] = now
+
+        elapsed = time.time() - start_time
+        percentage = current / total
+        speed = current / elapsed if elapsed > 0 else 0
+        eta = (total - current) / speed if speed > 0 else 0
+
+        progress_bar = create_progress_bar(current, total, proceso)
+        
+        # Formatear tiempos
+        elapsed_str = format_time(elapsed)
+        remaining_str = format_time(eta)
+        
+        # SOLO MOSTRAR BOTÓN DE CANCELACIÓN SI NO ES DESCARGA
+        reply_markup = None
+        if proceso != "DESCARGA":
+            reply_markup = InlineKeyboardMarkup([[
+                InlineKeyboardButton("⛔ Cancelar ⛔", callback_data=f"cancel_task_{msg.chat.id}")
+            ]])
+        
+        try:
+            await msg.edit(
+                f"   {progress_bar}\n"
+                f"┠ **Velocidad** {sizeof_fmt(speed)}/s\n"
+                f"┠ **Tiempo transcurrido:** {elapsed_str}\n"
+                f"┠ **Tiempo restante:** {remaining_str}\n╰━━━━━━━━━━━━━━━━━━╯\n",
+                reply_markup=reply_markup
+            )
+        except MessageNotModified:
+            pass
+        except Exception as e:
+            logger.error(f"Error editando mensaje de progreso: {e}")
+            # Si falla, remover de mensajes activos
+            if msg.id in active_messages:
+                active_messages.remove(msg.id)
+    except Exception as e:
+        logger.error(f"Error en progress_callback: {e}", exc_info=True)
 
 async def download_media_with_cancellation(message, msg, user_id, start_time):
     """Descarga medios con capacidad de cancelación"""
@@ -272,13 +998,41 @@ async def download_media_with_cancellation(message, msg, user_id, start_time):
         file_name = message.video.file_name or f"video_{file_id}.mp4"
         file_path = os.path.join("downloads", file_name)
         
+        # Obtener información del archivo para el progreso
+        file = await app.get_messages(message.chat.id, message.id)
+        file_size = file.video.file_size
+        
         # Iniciar descarga
-        downloaded = await app.download_media(
-            message.video,
-            file_name=file_path,
-            progress=progress_callback,
-            progress_args=(msg, "DESCARGA", start_time)
+        downloaded = 0
+        chunk_size = 1024 * 1024  # 1MB chunks
+        
+        # Crear tarea de descarga
+        download_task = asyncio.create_task(
+            app.download_media(
+                message,
+                file_name=file_path,
+                progress=progress_callback,
+                progress_args=(msg, "DESCARGA", start_time)
+            )
         )
+        
+        # NO REGISTRAR TAREA DE DESCARGA COMO CANCELABLE
+        # (se mantiene la capacidad de cancelación por comando /cancel)
+        
+        # Esperar a que la descarga termine o sea cancelada
+        try:
+            await download_task
+        except asyncio.CancelledError:
+            # La descarga fue cancelada
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            raise
+        
+        # Verificar si la descarga fue cancelada durante el proceso
+        if user_id not in cancel_tasks:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            raise asyncio.CancelledError("Descarga cancelada")
         
         return file_path
         
@@ -289,265 +1043,123 @@ async def download_media_with_cancellation(message, msg, user_id, start_time):
         logger.error(f"Error en descarga: {e}", exc_info=True)
         raise
 
-# ======================== MODIFICACIÓN EN EL MANEJADOR DE CALLBACKS ======================== #
+# ======================== FUNCIONALIDAD DE COLA POR ORDEN DE LLEGADA ======================== #
 
-@app.on_callback_query()
-async def callback_handler(client, callback_query: CallbackQuery):
-    # ... (código anterior se mantiene igual)
-    
-    # Manejar confirmaciones de compresión
-    if callback_query.data.startswith(("confirm_", "cancel_")):
-        action, confirmation_id_str = callback_query.data.split('_', 1)
-        confirmation_id = ObjectId(confirmation_id_str)
-        
-        confirmation = await get_confirmation(confirmation_id)
-        if not confirmation:
-            await callback_query.answer("⚠️ Esta solicitud ha expirado o ya fue procesada.", show_alert=True)
-            return
-            
-        user_id = callback_query.from_user.id
-        if user_id != confirmation["user_id"]:
-            await callback_query.answer("⚠️ No tienes permiso para esta acción.", show_alert=True)
-            return
-
-        if action == "confirm":
-            # Verificar límite nuevamente
-            if await check_user_limit(user_id):
-                await callback_query.answer("⚠️ Has alcanzado tu límite mensual de compresiones.", show_alert=True)
-                await delete_confirmation(confirmation_id)
-                return
-
-            # Verificar si ya hay una compresión activa o en cola
-            user_plan = await get_user_plan(user_id)
-            queue_limit = await get_user_queue_limit(user_id)
-            
-            # Contar tareas en cola de descarga y compresión
-            download_count = download_tasks_col.count_documents({"user_id": user_id})
-            pending_count = pending_col.count_documents({"user_id": user_id})
-            total_pending = download_count + pending_count
-            
-            # Verificar límites de cola según el plan
-            if total_pending >= queue_limit:
-                await callback_query.answer(
-                    f"⚠️ Ya tienes {total_pending} videos en proceso (límite: {queue_limit}).\n"
-                    "Espera a que se procesen antes de enviar más.",
-                    show_alert=True
-                )
-                await delete_confirmation(confirmation_id)
-                return
-
-            try:
-                message = await app.get_messages(confirmation["chat_id"], confirmation["message_id"])
-            except Exception as e:
-                logger.error(f"Error obteniendo mensaje: {e}")
-                await callback_query.answer("⚠️ Error al obtener el video. Intenta enviarlo de nuevo.", show_alert=True)
-                await delete_confirmation(confirmation_id)
-                return
-
-            await delete_confirmation(confirmation_id)
-            
-            # Editar mensaje de confirmación para mostrar estado
-            download_size = download_queue.qsize()
-            wait_msg = await callback_query.message.edit_text(
-                f"⏳ Tu video ha sido añadido a la cola de descarga.\n\n"
-                f"📋 Tamaño actual de cola de descarga: {download_size}\n\n"
-                f"• **Descargando** ⏳"
-            )
-
-            # Registrar tarea de descarga
-            download_tasks_col.insert_one({
-                "user_id": user_id,
-                "video_id": message.video.file_id,
-                "file_name": message.video.file_name,
+async def process_compression_queue():
+    while True:
+        client, message, wait_msg = await compression_queue.get()
+        try:
+            # Verificar si la tarea aún está en pending_col (no fue cancelada)
+            pending_task = pending_col.find_one({
                 "chat_id": message.chat.id,
-                "message_id": message.id,
-                "timestamp": datetime.datetime.now(),
-                "status": "pending"
+                "message_id": message.id
             })
-            
-            # Agregar a la cola de descarga
-            await download_queue.put((app, message, wait_msg, confirmation))
-            logger.info(f"Video confirmado y encolado para descarga de {user_id}: {message.video.file_name}")
+            if not pending_task:
+                logger.info(f"Tarea cancelada, saltando: {message.video.file_name}")
+                compression_queue.task_done()
+                continue
 
-        elif action == "cancel":
-            await delete_confirmation(confirmation_id)
-            await callback_query.answer("⛔ Compresión cancelada.⛔", show_alert=True)
-            try:
-                await callback_query.message.edit_text("⛔ **Compresión cancelada.** ⛔")
-                # Borrar mensaje después de 5 segundos
-                await asyncio.sleep(5)
-                await callback_query.message.delete()
-            except:
-                pass
+            start_msg = await wait_msg.edit("🗜️**Iniciando compresión**🎬")
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(executor, threading_compress_video, client, message, start_msg)
+        except Exception as e:
+            logger.error(f"Error procesando video: {e}", exc_info=True)
+            await app.send_message(message.chat.id, f"⚠️ Error al procesar el video: {str(e)}")
+        finally:
+            pending_col.delete_one({"video_id": message.video.file_id})
+            compression_queue.task_done()
+
+def threading_compress_video(client, message, start_msg):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(compress_video(client, message, start_msg))
+    loop.close()
+
+@app.on_message(filters.command(["deleteall"]) & filters.user(admin_users))
+async def delete_all_pending(client, message):
+    result = pending_col.delete_many({})
+    await message.reply(f"**Cola eliminada.**\n**Se eliminaron {result.deleted_count} elementos.**")
+
+@app.on_message(filters.regex(r"^/del_(\d+)$") & filters.user(admin_users))
+async def delete_one_from_pending(client, message):
+    match = message.text.strip().split("_")
+    if len(match) != 2 or not match[1].isdigit():
+        await message.reply("⚠️ Formato inválido. Usa `/del_1`, `/del_2`, etc.")
         return
 
-    # ... (el resto del código se mantiene igual)
+    index = int(match[1]) - 1
+    cola = list(pending_col.find().sort([("timestamp", 1)]))
 
-# ======================== MODIFICACIÓN EN LA FUNCIÓN DE COMPRESIÓN ======================== #
+    if index < 0 or index >= len(cola):
+        await message.reply("⚠️ Número fuera de rango.")
+        return
 
-async def compress_video(client, message: Message, start_msg, file_path, confirmation_data):
-    """Función de compresión modificada para usar el archivo ya descargado"""
-    try:
-        if not message.video:
-            await app.send_message(chat_id=message.chat.id, text="Por favor envía un vídeo válido")
-            return
+    eliminado = cola[index]
+    pending_col.delete_one({"_id": eliminado["_id"]})
 
-        logger.info(f"Iniciando compresión para chat_id: {message.chat.id}, video: {message.video.file_name}")
-        user_id = message.from_user.id
-        original_message_id = message.id
+    file_name = eliminado.get("file_name", "¿?")
+    user_id = eliminado["user_id"]
+    tiempo = eliminado.get("timestamp")
+    tiempo_str = tiempo.strftime("%Y-%m-d %H:%M:%S") if tiempo else "¿?"
 
-        # Obtener configuración personalizada del usuario
-        user_video_settings = await get_user_video_settings(user_id)
+    await message.reply(
+        f"✅ Eliminado de la cola:\n"
+        f"📁 {file_name}\n👤 ID: `{user_id}`\n⏰ {tiempo_str}"
+    )
 
-        # Registrar compresión activa
-        await add_active_compression(user_id, message.video.file_id)
+async def show_queue(client, message):
+    """Muestra la cola de compresión"""
+    cola = list(pending_col.find().sort([("timestamp", 1)]))
 
-        # Crear mensaje de progreso como respuesta al video original
-        msg = await app.send_message(
-            chat_id=message.chat.id,
-            text="🗜️ **Iniciando Compresión** 🎬",
-            reply_to_message_id=message.id
-        )
-        active_messages.add(msg.id)
+    if not cola:
+        await message.reply("📋**La cola está vacía.**")
+        return
+
+    respuesta = "🗜️**Cola de Compresión**👥\n\n"
+    for i, item in enumerate(cola, 1):
+        user_id = item["user_id"]
+        file_name = item.get("file_name", "¿?")
+        tiempo = item.get("timestamp")
+        tiempo_str = tiempo.strftime("%H:%M:%S") if tiempo else "¿?"
         
-        # Agregar botón de cancelación
-        cancel_button = InlineKeyboardMarkup([[
-            InlineKeyboardButton("⛔ Cancelar ⛔", callback_data=f"cancel_task_{user_id}")
-        ]])
-        await msg.edit_reply_markup(cancel_button)
-        
+        # Obtener información del usuario
         try:
-            # Verificar si se canceló antes de comenzar la compresión
-            if user_id not in cancel_tasks:
-                logger.info("Compresión cancelada por el usuario antes de comenzar")
-                await remove_active_compression(user_id)
-                unregister_cancelable_task(user_id)
-                try:
-                    await start_msg.delete()
-                except:
-                    pass
-                if msg.id in active_messages:
-                    active_messages.remove(msg.id)
-                try:
-                    await msg.delete()
-                except:
-                    pass
-                await send_protected_message(
-                    message.chat.id,
-                    "⛔ **Compresión cancelada** ⛔",
-                    reply_to_message_id=original_message_id
-                )
-                return
-                
-            original_size = os.path.getsize(file_path)
-            logger.info(f"Tamaño original: {original_size} bytes")
-            await notify_group(client, message, original_size, status="start")
-            
-            try:
-                probe = ffmpeg.probe(file_path)
-                dur_total = float(probe['format']['duration'])
-                logger.info(f"Duración del video: {dur_total} segundos")
-            except Exception as e:
-                logger.error(f"Error obteniendo duración: {e}", exc_info=True)
-                dur_total = 0
-
-            # Mensaje de inicio de compresión como respuesta al video
-            await msg.edit(
-                "╭━━━━[🤖**Compress Bot**]━━━━━╮\n"
-                "┠➣ 🗜️𝗖𝗼𝗺𝗽𝗿𝗶𝗺𝗶𝗲𝗻𝗱𝗼 𝗩𝗶𝗱𝗲𝗼🎬\n"
-                "┠➣ **Progreso**: 📤 𝘊𝘢𝘳𝘨𝘢𝘯𝘥𝘰 𝘝𝘪𝘥𝘦𝘰 📤\n"
-                "╰━━━━━━━━━━━━━━━━━━━━━╯",
-                reply_markup=cancel_button
-            )
-            
-            compressed_video_path = f"{os.path.splitext(file_path)[0]}_compressed.mp4"
-            logger.info(f"Ruta de compresión: {compressed_video_path}")
-            
-            # ... (el resto del código de compresión se mantiene igual, usando file_path en lugar de original_video_path)
-
-        except Exception as e:
-            logger.error(f"Error en compresión: {e}", exc_info=True)
-            await msg.delete()
-            await app.send_message(chat_id=message.chat.id, text=f"Ocurrió un error al comprimir el video: {e}")
-        finally:
-            try:
-                # Limpiar mensajes activos
-                if msg.id in active_messages:
-                    active_messages.remove(msg.id)
-                if 'upload_msg' in locals() and upload_msg.id in active_messages:
-                    active_messages.remove(upload_msg.id)
-                    
-                # Eliminar archivo descargado (ya no se necesita)
-                if file_path and os.path.exists(file_path):
-                    os.remove(file_path)
-                    logger.info(f"Archivo temporal eliminado: {file_path}")
-                    
-                for compressed_path in [compressed_video_path]:
-                    if compressed_path and os.path.exists(compressed_path):
-                        os.remove(compressed_path)
-                        logger.info(f"Archivo comprimido eliminado: {compressed_path}")
-                if 'thumbnail_path' in locals() and thumbnail_path and os.path.exists(thumbnail_path):
-                    os.remove(thumbnail_path)
-                    logger.info(f"Miniatura eliminada: {thumbnail_path}")
-            except Exception as e:
-                logger.error(f"Error eliminando archivos temporales: {e}", exc_info=True)
-    except Exception as e:
-        logger.critical(f"Error crítico en compress_video: {e}", exc_info=True)
-        await app.send_message(chat_id=message.chat.id, text="⚠️ Ocurrió un error crítico al procesar el video")
-    finally:
-        await remove_active_compression(user_id)
-        unregister_cancelable_task(user_id)
-        unregister_ffmpeg_process(user_id)
+            user = await app.get_users(user_id)
+            username = f"@{user.username}" if user.username else "Sin username"
+        except:
+            username = "Sin username"
         
-# ======================== INICIALIZACIÓN DE LAS COLAS AL INICIAR EL BOT ======================== #
+        # Obtener el plan del usuario para mostrarlo
+        user_plan = await get_user_plan(user_id)
+        plan_name = user_plan["plan"].capitalize() if user_plan and user_plan.get("plan") else "Sin plan"
+        
+        respuesta += f"{i}• 📁 {file_name}\n👤 {username}\n🆔 ID: `{user_id}`\n📋 {plan_name}\n\n"
 
-# Mover la creación de las tareas dentro del manejador de inicio
-@app.on_start()
-async def on_start(client):
-    global processing_task, download_task
-    
-    logger.info("🔄 Iniciando procesamiento de las colas...")
+    await message.reply(respuesta)
 
-    # Cargar tareas de descarga pendientes
-    pendientes = download_tasks_col.find({"status": "pending"}).sort([("timestamp", 1)])
+@app.on_message(filters.command("auto") & filters.user(admin_users))
+async def startup_command(_, message):
+    global processing_task
+    msg = await message.reply("🔄 Iniciando procesamiento de la cola...")
+
+    pendientes = pending_col.find().sort([("timestamp", 1)])
     for item in pendientes:
         try:
             user_id = item["user_id"]
             chat_id = item["chat_id"]
             message_id = item["message_id"]
+            timestamp = item["timestamp"]
             
             message = await app.get_messages(chat_id, message_id)
             wait_msg = await app.send_message(chat_id, f"🔄 Recuperado desde cola persistente.")
             
-            await download_queue.put((app, message, wait_msg, {}))
+            await compression_queue.put((app, message, wait_msg))
         except Exception as e:
-            logger.error(f"Error cargando descarga pendiente: {e}")
+            logger.error(f"Error cargando pendiente: {e}")
 
-    # Cargar tareas de compresión pendientes
-    compresiones_pendientes = pending_col.find().sort([("timestamp", 1)])
-    for item in compresiones_pendientes:
-        try:
-            user_id = item["user_id"]
-            chat_id = item["chat_id"]
-            message_id = item["message_id"]
-            file_path = item["file_path"]
-            confirmation_data = item.get("confirmation_data", {})
-            
-            message = await app.get_messages(chat_id, message_id)
-            wait_msg = await app.send_message(chat_id, f"🔄 Recuperado desde cola de compresión persistente.")
-            
-            await compression_queue.put((app, message, wait_msg, file_path, confirmation_data))
-        except Exception as e:
-            logger.error(f"Error cargando compresión pendiente: {e}")
-
-    # Iniciar workers si no están activos
-    if download_task is None or download_task.done():
-        download_task = asyncio.create_task(process_download_queue())
-        
     if processing_task is None or processing_task.done():
         processing_task = asyncio.create_task(process_compression_queue())
-        
-    logger.info("✅ Procesamiento de colas iniciado.")
+    await msg.edit("✅ Procesamiento de cola iniciado.")
 
 # ======================== FIN FUNCIONALIDAD DE COLA ======================== #
 
